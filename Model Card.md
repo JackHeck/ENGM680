@@ -34,7 +34,7 @@ This model was developed to explore LSTM performance on noisy industrial dataset
 - Real-time industrial control or safety-critical decision systems  
 - Financial, regulatory, or autonomous process decision-making  
 - Use on unrelated datasets without appropriate preprocessing  
-- Any other uses than stated in Primary use
+- Any other uses other than stated in Primary use
 
 ---
 
