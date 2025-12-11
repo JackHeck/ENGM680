@@ -1,34 +1,27 @@
-"""
-High-standard LSTM pipeline with:
- - Robust CSV loading
- - Timestamp correction
- - Iron/Non-Iron dataset split
- - Normalization
- - Sequence dataset
- - LSTM regression model
- - Early stopping
- - Evaluation + plots
-"""
-
 # ============================================================
-# 1) Imports
+# 0) Imports
 # ============================================================
+import time
 import os
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+from sklearn.ensemble import RandomForestRegressor
+import xgboost as xgb
+
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-import matplotlib.pyplot as plt
 
 
 # ============================================================
-# 2) Utility: CSV loader with encoding fallback
+# 1) Utility: CSV loader with encoding fallback
 # ============================================================
 def load_csv_safely(filename, encodings=None):
-    """Load a CSV with multiple encoding fallbacks."""
     if encodings is None:
         encodings = ["utf-8", "latin-1", "cp1252"]
 
@@ -42,48 +35,36 @@ def load_csv_safely(filename, encodings=None):
         except UnicodeDecodeError:
             print(f"Encoding '{enc}' failed – trying next…")
         except FileNotFoundError:
-            raise FileNotFoundError(
-                f"File not found in directory: {os.getcwd()}"
-            )
+            raise FileNotFoundError(f"File not found in: {os.getcwd()}")
 
     raise UnicodeDecodeError("Unable to read file with provided encodings.")
 
 
 # ============================================================
-# 3) Data cleaning utilities
+# 2) Data cleaning utilities
 # ============================================================
 def convert_comma_numbers(df):
-    """Convert comma decimals to dots and numeric values."""
     df = df.replace(",", ".", regex=True)
     return df.apply(lambda col: pd.to_numeric(col, errors="ignore"))
 
-
 def process_timestamps(df):
-    """Fix timestamps, generate ordered timestamp column."""
-    # Find date column
     date_col = next((c for c in df.columns if "date" in c.lower()), df.columns[0])
     print(f"Detected date column: {date_col}")
 
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-
-    # String timestamp for grouping
     df["date_str"] = df[date_col].dt.strftime("%Y-%m-%d %H:%M")
-    duplicate_counts = df.groupby("date_str").cumcount()
 
+    duplicate_counts = df.groupby("date_str").cumcount()
     df["date_ordered"] = [
         ts if n == 0 else f"{ts}-{n}"
         for ts, n in zip(df["date_str"], duplicate_counts)
     ]
 
-    # Clean output
     df = df.drop(columns=[date_col, "date_str"])
     df = df.rename(columns={"date_ordered": "date"})
-
     return df
 
-
 def split_iron_versions(df):
-    """Return df_with_iron and df_without_iron."""
     iron_col = next(
         (c for c in df.columns if "iron" in c.lower() and "concentrate" in c.lower()),
         None,
@@ -93,15 +74,145 @@ def split_iron_versions(df):
         print(f"Iron concentrate column found: {iron_col}")
         return df.copy(), df.drop(columns=[iron_col])
     else:
-        print("Iron concentrate column not found.")
+        print("Iron concentrate column NOT found.")
         return df.copy(), df.copy()
 
 
 # ============================================================
-# 4) Dataset class for LSTM sequences
+# 3) ---- Load + Clean + Build df_with_iron BEFORE modeling ----
 # ============================================================
+file_name = "MiningProcess_Flotation_Plant_Database.csv"
+
+# 3.1 Load safely
+df_raw = load_csv_safely(file_name)
+
+# 3.2 Fix numbers
+df_raw = convert_comma_numbers(df_raw)
+
+# 3.3 Fix timestamps
+df_raw = process_timestamps(df_raw)
+
+# 3.4 Create iron vs non-iron versions
+df_with_iron, df_without_iron = split_iron_versions(df_raw)
+
+# 3.5 Final dataset used for modeling
+df = df_with_iron.copy()
+print("Final dataset shape:", df.shape)
+
+
+# ============================================================
+# 4) Clean numeric columns + sort
+# ============================================================
+df = df.replace(",", ".", regex=True)
+df = df.apply(lambda col: pd.to_numeric(col, errors='ignore'))
+
+df["date"] = df["date"].astype(str)
+df = df.sort_values("date").reset_index(drop=True)
+
+
+# ============================================================
+# 5) Feature/Target split
+# ============================================================
+target_col = "% Silica Concentrate"
+feature_cols = [c for c in df.columns if c not in ["date", target_col]]
+
+X = df[feature_cols]
+y = df[target_col]
+
+
+# ============================================================
+# 6) Train/Validation Split (time-based)
+# ============================================================
+split_idx = int(len(df) * 0.8)
+X_train, X_val = X.iloc[:split_idx], X.iloc[split_idx:]
+y_train, y_val = y.iloc[:split_idx], y.iloc[split_idx:]
+
+
+# ============================================================
+# 7) Scaling
+# ============================================================
+scaler = StandardScaler()
+X_train_s = scaler.fit_transform(X_train)
+X_val_s = scaler.transform(X_val)
+
+
+# ============================================================
+# 8) MODEL 1: XGBOOST
+# ============================================================
+print("\n=== TRAINING XGBOOST ===")
+
+start = time.time()
+
+try:
+    model_xgb = xgb.XGBRegressor(
+        n_estimators=500,
+        max_depth=8,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        tree_method="hist",
+        device="cuda",
+        random_state=42,
+    )
+except:
+    model_xgb = xgb.XGBRegressor(
+        n_estimators=500,
+        max_depth=8,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        tree_method="hist",
+        random_state=42,
+    )
+
+model_xgb.fit(
+    X_train_s, y_train,
+    eval_set=[(X_train_s, y_train), (X_val_s, y_val)],
+    eval_metric="rmse",
+    verbose=False,
+)
+
+xgb_train_time = time.time() - start
+
+y_pred_xgb = model_xgb.predict(X_val_s)
+xgb_r2 = r2_score(y_val, y_pred_xgb)
+xgb_mae = mean_absolute_error(y_val, y_pred_xgb)
+xgb_rmse = np.sqrt(mean_squared_error(y_val, y_pred_xgb))
+
+xgb_train_loss = model_xgb.evals_result()['validation_0']['rmse']
+xgb_val_loss = model_xgb.evals_result()['validation_1']['rmse']
+
+
+# ============================================================
+# 9) MODEL 2: RANDOM FOREST
+# ============================================================
+print("\n=== TRAINING RANDOM FOREST ===")
+
+start = time.time()
+
+model_rf = RandomForestRegressor(
+    n_estimators=300,
+    random_state=42,
+    n_jobs=-1
+)
+
+model_rf.fit(X_train_s, y_train)
+rf_train_time = time.time() - start
+
+y_pred_rf = model_rf.predict(X_val_s)
+rf_r2 = r2_score(y_val, y_pred_rf)
+rf_mae = mean_absolute_error(y_val, y_pred_rf)
+rf_rmse = np.sqrt(mean_squared_error(y_val, y_pred_rf))
+
+
+# ============================================================
+# 10) MODEL 3: LSTM
+# ============================================================
+print("\n=== TRAINING LSTM ===")
+
+SEQ_LEN = 10
+
 class SeqDataset(Dataset):
-    """Time-window dataset for LSTM."""
     def __init__(self, X, y, seq_len):
         self.X = X
         self.y = y
@@ -111,187 +222,71 @@ class SeqDataset(Dataset):
         return len(self.X) - self.seq_len
 
     def __getitem__(self, idx):
-        X_seq = self.X[idx : idx + self.seq_len]
-        y_target = self.y[idx + self.seq_len]
+        X_seq = self.X[idx:idx+self.seq_len]
+        y_t = self.y[idx+self.seq_len]
         return (
             torch.tensor(X_seq, dtype=torch.float32),
-            torch.tensor(y_target, dtype=torch.float32),
+            torch.tensor([y_t], dtype=torch.float32)
         )
 
+X_train_np = X_train_s
+X_val_np = X_val_s
+y_train_np = y_train.values
+y_val_np = y_val.values
 
-# ============================================================
-# 5) LSTM model
-# ============================================================
-class LSTMRegressor(nn.Module):
-    def __init__(self, n_features, hidden=128, num_layers=2, dropout=0.2):
+train_ds = SeqDataset(X_train_np, y_train_np, SEQ_LEN)
+val_ds = SeqDataset(X_val_np, y_val_np, SEQ_LEN)
+
+train_dl = DataLoader(train_ds, batch_size=64, shuffle=True)
+val_dl = DataLoader(val_ds, batch_size=64, shuffle=False)
+
+class LSTMReg(nn.Module):
+    def __init__(self, n_features):
         super().__init__()
-        self.lstm = nn.LSTM(
-            input_size=n_features,
-            hidden_size=hidden,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout,
-        )
-        self.fc = nn.Linear(hidden, 1)
+        self.lstm = nn.LSTM(n_features, 128, batch_first=True, num_layers=2, dropout=0.2)
+        self.fc = nn.Linear(128, 1)
 
     def forward(self, x):
         out, _ = self.lstm(x)
-        out = out[:, -1, :]  # last timestep
-        return self.fc(out)
+        return self.fc(out[:, -1, :])
 
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model_lstm = LSTMReg(n_features=X_train_s.shape[1]).to(device)
 
-# ============================================================
-# 6) Train function with early stopping
-# ============================================================
-def train_model(model, train_dl, val_dl, device, epochs=20, lr=0.001):
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model_lstm.parameters(), lr=0.001)
 
-    best_loss = float("inf")
-    patience = 5
-    patience_counter = 0
+EPOCHS = 20
+lstm_train_loss = []
+lstm_val_loss = []
 
-    train_hist, val_hist = [], []
+start = time.time()
 
-    for epoch in range(epochs):
-        # ----- Training -----
-        model.train()
-        train_losses = []
+for epoch in range(EPOCHS):
 
-        for Xb, yb in train_dl:
-            Xb, yb = Xb.to(device), yb.to(device)
+    # ---- TRAIN ----
+    model_lstm.train()
+    batch_losses = []
+    for xb, yb in train_dl:
+        xb, yb = xb.to(device), yb.to(device)
+        optimizer.zero_grad()
+        pred = model_lstm(xb)
+        loss = criterion(pred, yb)
+        loss.backward()
+        optimizer.step()
+        batch_losses.append(loss.item())
+    lstm_train_loss.append(np.mean(batch_losses))
 
-            optimizer.zero_grad()
-            pred = model(Xb)
-            loss = criterion(pred, yb)
-            loss.backward()
-            optimizer.step()
-
-            train_losses.append(loss.item())
-
-        avg_train = np.mean(train_losses)
-
-        # ----- Validation -----
-        model.eval()
-        val_losses = []
-        with torch.no_grad():
-            for Xb, yb in val_dl:
-                Xb, yb = Xb.to(device), yb.to(device)
-                pred = model(Xb)
-                val_losses.append(criterion(pred, yb).item())
-
-        avg_val = np.mean(val_losses)
-        train_hist.append(avg_train)
-        val_hist.append(avg_val)
-
-        print(f"Epoch {epoch+1}/{epochs} | Train: {avg_train:.4f} | Val: {avg_val:.4f}")
-
-        # ----- Early stopping -----
-        if avg_val < best_loss:
-            best_loss = avg_val
-            patience_counter = 0
-            best_state = model.state_dict()
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print("Early stopping triggered.")
-                break
-
-    model.load_state_dict(best_state)
-    return model, train_hist, val_hist
-
-
-# ============================================================
-# 7) Main pipeline
-# ============================================================
-def main():
-    # ---------------- Load & clean data ----------------
-    df = load_csv_safely("MiningProcess_Flotation_Plant_Database.csv")
-    df = convert_comma_numbers(df)
-    df = process_timestamps(df)
-    df_with_iron, df_without_iron = split_iron_versions(df)
-
-    # Select dataset
-    df = df_with_iron.copy()
-
-    # ---------------- Sorting & cleaning ----------------
-    df["date"] = df["date"].astype(str)
-    df = df.sort_values("date").reset_index(drop=True)
-
-    # ---------------- Feature split ----------------
-    target_col = "% Silica Concentrate"
-    features = [c for c in df.columns if c not in ["date", target_col]]
-
-    X = df[features].values
-    y = df[target_col].values.reshape(-1, 1)
-
-    # ---------------- Scaling ----------------
-    scaler_X = StandardScaler()
-    scaler_y = StandardScaler()
-    Xs = scaler_X.fit_transform(X)
-    ys = scaler_y.fit_transform(y)
-
-    # ---------------- Train/val split ----------------
-    split_idx = int(len(df) * 0.8)
-    X_train, X_val = Xs[:split_idx], Xs[split_idx:]
-    y_train, y_val = ys[:split_idx], ys[split_idx:]
-
-    # ---------------- Sequence windows ----------------
-    SEQ_LEN = 32
-    train_dl = DataLoader(SeqDataset(X_train, y_train, SEQ_LEN), batch_size=64)
-    val_dl = DataLoader(SeqDataset(X_val, y_val, SEQ_LEN), batch_size=64)
-
-    # ---------------- Model ----------------
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Using:", device)
-
-    model = LSTMRegressor(n_features=X.shape[1]).to(device)
-
-    # ---------------- Train ----------------
-    model, train_hist, val_hist = train_model(model, train_dl, val_dl, device)
-
-    # ---------------- Validation prediction ----------------
-    model.eval()
-    preds = []
+    # ---- VALIDATION ----
+    model_lstm.eval()
+    v_losses = []
     with torch.no_grad():
-        for Xb, _ in val_dl:
-            preds.extend(model(Xb.to(device)).cpu().numpy())
+        for xb, yb in val_dl:
+            xb, yb = xb.to(device), yb.to(device)
+            pred = model_lstm(xb)
+            v_losses.append(criterion(pred, yb).item())
+    lstm_val_loss.append(np.mean(v_losses))
 
-    preds = scaler_y.inverse_transform(preds)
-    y_true = scaler_y.inverse_transform(y_val[SEQ_LEN:])
+    print(f"Epoch {epoch+1}/{EPOCHS}  TrainLoss={lstm_train_loss[-1]:.4f}  ValLoss={lstm_val_loss[-1]:.4f}")
 
-    # ---------------- Metrics ----------------
-    mae = mean_absolute_error(y_true, preds)
-    mse = mean_squared_error(y_true, preds)
-    rmse = np.sqrt(mse)
-    r2 = r2_score(y_true, preds)
-
-    print("\nModel Performance")
-    print("----------------------")
-    print(f"MAE:  {mae:.4f}")
-    print(f"MSE:  {mse:.4f}")
-    print(f"RMSE: {rmse:.4f}")
-    print(f"R²:   {r2:.4f}")
-
-    # ---------------- Plots ----------------
-    plt.figure(figsize=(14, 5))
-    plt.plot(y_true, label="True")
-    plt.plot(preds, label="Predicted")
-    plt.legend()
-    plt.title("LSTM Prediction vs True (% Silica Concentrate)")
-    plt.show()
-
-    plt.figure(figsize=(10, 5))
-    plt.plot(train_hist, label="Train")
-    plt.plot(val_hist, label="Val")
-    plt.title("Training vs Validation Loss")
-    plt.legend()
-    plt.grid()
-    plt.show()
-
-
-# ============================================================
-# 8) Run script
-# ============================================================
-if __name__ == "__main__":
-    main()
+lstm_train_time = time.time() - start
