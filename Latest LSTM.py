@@ -1,3 +1,16 @@
+import warnings
+import os
+
+# Suppress ALL warnings (including FutureWarning, UserWarning, CUDA warnings, etc.)
+warnings.filterwarnings("ignore")
+
+# Disable XGBoost debug logs
+os.environ["XGBOOST_VERBOSE"] = "0"
+os.environ["PYTHONWARNINGS"] = "ignore"
+
+# Clean PyTorch warning spam
+os.environ["TORCH_CPP_LOG_LEVEL"] = "ERROR"
+
 # ============================================================
 # 0) Imports
 # ============================================================
@@ -256,7 +269,7 @@ model_lstm = LSTMReg(n_features=X_train_s.shape[1]).to(device)
 criterion = nn.MSELoss()
 optimizer = torch.optim.Adam(model_lstm.parameters(), lr=0.001)
 
-EPOCHS = 20
+EPOCHS = 5
 lstm_train_loss = []
 lstm_val_loss = []
 
