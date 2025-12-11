@@ -104,7 +104,7 @@ The model is trained on the **Mining Process Flotation Plant Database**, consist
 - **MAE** (Mean Absolute Error)  
 - **MSE** (Mean Squared Error)  
 - **RMSE**  
-- **R² Score** (negative, indicating poor model performance)
+- **R² Score** 
 
 ### **Baseline Comparison**
 - Compared with classical models such as **XGBoost**  
